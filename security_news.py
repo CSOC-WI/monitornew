@@ -134,7 +134,13 @@ def init_collections(db) -> None:
 def fetch_url(url: str, timeout: int = 15) -> Optional[bytes]:
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "SecurityNewsCollector/2.0 (RSS reader)"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            "Accept-Language": "en-US,en;q=0.9,th;q=0.8",
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
