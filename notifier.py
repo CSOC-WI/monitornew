@@ -43,7 +43,10 @@ def send_discord(webhook_url: str, articles: list[dict]) -> tuple[bool, str]:
     payload = json.dumps({"embeds": [embed]}).encode()
     req = urllib.request.Request(
         webhook_url, data=payload,
-        headers={"Content-Type": "application/json"}, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        }, method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -70,7 +73,10 @@ def test_discord(webhook_url: str) -> tuple[bool, str]:
     }).encode()
     req = urllib.request.Request(
         webhook_url, data=payload,
-        headers={"Content-Type": "application/json"}, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        }, method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
