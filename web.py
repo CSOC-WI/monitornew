@@ -986,9 +986,10 @@ function confirmDelete(id, name) {
 }
 function closeModal() { document.getElementById('modalOverlay').classList.remove('show'); _deleteId=null; }
 async function doDelete() {
+  const id = _deleteId;
   closeModal();
   try {
-    await deleteReq(`/api/feeds/${_deleteId}`);
+    await deleteReq(`/api/feeds/${id}`);
     showToast('Feed deleted','success');
     await loadFeedTable(); await loadStats(); await loadArticles();
   } catch(e) { showToast('Delete failed','error'); }

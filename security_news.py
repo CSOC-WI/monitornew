@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 import urllib.request
 import urllib.error
+import http.cookiejar
 import xml.etree.ElementTree as ET
 
 from pymongo import MongoClient, DESCENDING, ASCENDING
@@ -131,26 +132,43 @@ def init_collections(db) -> None:
 
 # ─── RSS fetching ─────────────────────────────────────────────────────────────
 
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    "Accept-Language": "en-US,en;q=0.9,th;q=0.8",
+}
+
+
 def fetch_url(url: str, timeout: int = 15) -> Optional[bytes]:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/131.0.0.0 Safari/537.36",
-            "Accept": "application/rss+xml, application/xml, text/xml, */*",
-            "Accept-Language": "en-US,en;q=0.9,th;q=0.8",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except urllib.error.URLError as e:
-        print(f"  [WARN] fetch failed: {e}", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"  [WARN] {e}", file=sys.stderr)
-        return None
+    """Fetch URL with cookie support and retry for WAF challenges (Incapsula)."""
+    cj     = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+    for attempt in range(3):
+        req = urllib.request.Request(url, headers=_HEADERS)
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                data = resp.read()
+            # Check if we got a WAF challenge page instead of real content
+            if b'<rss' in data[:500] or b'<feed' in data[:500] or b'<?xml' in data[:200]:
+                return data
+            # Incapsula challenge — cookies set, retry
+            if b'Incapsula' in data or b'_Incapsula_Resource' in data:
+                import time
+                time.sleep(1)
+                continue
+            # Unknown HTML — return as-is (parser will handle error)
+            return data
+        except urllib.error.URLError as e:
+            print(f"  [WARN] fetch failed (attempt {attempt+1}): {e}", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"  [WARN] {e}", file=sys.stderr)
+            return None
+    print(f"  [WARN] WAF challenge not resolved after retries: {url}", file=sys.stderr)
+    return None
 
 
 def parse_date(text: Optional[str]) -> Optional[str]:
