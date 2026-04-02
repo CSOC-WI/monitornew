@@ -1,0 +1,51 @@
+services:
+
+  app:
+    build: .
+    container_name: secnews_app
+    ports:
+      - "8080:8080"
+    environment:
+      MONGO_URI: mongodb://mongodb:27017
+      MONGO_DB:  secnews
+      TZ:        Asia/Bangkok          # scheduler uses Bangkok time (UTC+7)
+      # Optional — override via .env file or environment variables:
+      # DISCORD_WEBHOOK_URL: https://discord.com/api/webhooks/...
+      # TELEGRAM_TOKEN:      123456:ABC-DEF...
+      # TELEGRAM_CHAT_ID:    -100123456789
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    container_name: secnews_mongo
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Optional: MongoDB web UI  (docker compose --profile debug up)
+  mongo-express:
+    image: mongo-express:1
+    container_name: secnews_mongoexpress
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_BASICAUTH: "false"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - debug
+
+volumes:
+  mongo_data:

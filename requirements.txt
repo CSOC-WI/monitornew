@@ -1,0 +1,3 @@
+pymongo==4.7.3
+apscheduler==3.10.4
+pytz==2024.1
