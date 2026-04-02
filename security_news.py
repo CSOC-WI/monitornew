@@ -143,8 +143,13 @@ _HEADERS = {
 
 def fetch_url(url: str, timeout: int = 15) -> Optional[bytes]:
     """Fetch URL with cookie support and retry for WAF challenges (Incapsula)."""
+    import ssl
+    import time
+
     cj     = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    # Try with default SSL first; fall back to unverified if needed
+    handlers = [urllib.request.HTTPCookieProcessor(cj)]
+    opener   = urllib.request.build_opener(*handlers)
 
     for attempt in range(3):
         req = urllib.request.Request(url, headers=_HEADERS)
@@ -156,16 +161,40 @@ def fetch_url(url: str, timeout: int = 15) -> Optional[bytes]:
                 return data
             # Incapsula challenge — cookies set, retry
             if b'Incapsula' in data or b'_Incapsula_Resource' in data:
-                import time
-                time.sleep(1)
+                print(f"  [INFO] WAF challenge detected for {url}, retrying ({attempt+1}/3)…",
+                      file=sys.stderr)
+                time.sleep(1.5)
                 continue
             # Unknown HTML — return as-is (parser will handle error)
             return data
+        except urllib.error.HTTPError as e:
+            print(f"  [WARN] HTTP {e.code} for {url} (attempt {attempt+1})", file=sys.stderr)
+            if attempt < 2:
+                time.sleep(1)
+                continue
+            return None
         except urllib.error.URLError as e:
-            print(f"  [WARN] fetch failed (attempt {attempt+1}): {e}", file=sys.stderr)
+            reason = str(e.reason) if hasattr(e, 'reason') else str(e)
+            print(f"  [WARN] URLError for {url}: {reason} (attempt {attempt+1})", file=sys.stderr)
+            # SSL certificate error → retry with unverified context
+            if 'CERTIFICATE_VERIFY_FAILED' in reason or 'SSL' in reason:
+                print(f"  [INFO] Retrying {url} with unverified SSL…", file=sys.stderr)
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                handlers = [
+                    urllib.request.HTTPCookieProcessor(cj),
+                    urllib.request.HTTPSHandler(context=ctx),
+                ]
+                opener = urllib.request.build_opener(*handlers)
+                time.sleep(0.5)
+                continue
+            if attempt < 2:
+                time.sleep(1)
+                continue
             return None
         except Exception as e:
-            print(f"  [WARN] {e}", file=sys.stderr)
+            print(f"  [WARN] {type(e).__name__}: {e} for {url}", file=sys.stderr)
             return None
     print(f"  [WARN] WAF challenge not resolved after retries: {url}", file=sys.stderr)
     return None
