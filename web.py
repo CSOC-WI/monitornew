@@ -7,7 +7,13 @@ Run: python3 web.py [--host 0.0.0.0] [--port 8080]
 import os
 import json
 import re
+import base64
+import hashlib
+import hmac
+import logging
 import argparse
+import threading
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -16,6 +22,7 @@ from urllib.parse import urlparse, parse_qs
 from pymongo import MongoClient, DESCENDING
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
+from bson.errors import InvalidId
 from datetime import datetime
 
 from security_news import (
@@ -28,10 +35,58 @@ from notifier  import (
 )
 import scheduler as sched
 
+log = logging.getLogger("secnews.web")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME   = os.environ.get("MONGO_DB",  "secnews")
+
+# Auth & Session — set ADMIN_USER / ADMIN_PASS env vars to enable
+# If both are empty the server still runs but warns (suitable for localhost-only)
+_ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
+_ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
+_AUTH_ENABLED = bool(_ADMIN_USER and _ADMIN_PASS)
+
+_SESSION_SECRET = os.environ.get("SESSION_SECRET", os.urandom(32).hex())
+
+# ─── Rate limiter (in-memory, per IP, resets every 60 s) ─────────────────────
+_RATE_LOCK    = threading.Lock()
+_RATE_STORE: dict = defaultdict(lambda: {"count": 0, "ts": 0.0})
+_RATE_LIMIT   = int(os.environ.get("RATE_LIMIT", "120"))   # requests per minute
+_RATE_WINDOW  = 60  # seconds
+
+def _check_rate(ip: str) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    import time
+    now = time.monotonic()
+    with _RATE_LOCK:
+        rec = _RATE_STORE[ip]
+        if now - rec["ts"] > _RATE_WINDOW:
+            rec["count"] = 0
+            rec["ts"]    = now
+        rec["count"] += 1
+        return rec["count"] <= _RATE_LIMIT
+
+# ─── Security headers ─────────────────────────────────────────────────────────
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options":  "nosniff",
+    "X-Frame-Options":         "DENY",
+    "X-XSS-Protection":        "1; mode=block",
+    "Referrer-Policy":         "strict-origin-when-cross-origin",
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none';"
+    ),
+    "Cache-Control":           "no-store",
+}
+
+MAX_BODY_BYTES = 1 * 1024 * 1024  # 1 MB
 
 _client = None
 
@@ -43,9 +98,124 @@ def get_db():
 
 
 def oid(s: str) -> ObjectId:
-    return ObjectId(s)
+    """Convert string to ObjectId; raises ValueError on invalid format."""
+    try:
+        return ObjectId(s)
+    except (InvalidId, Exception) as exc:
+        raise ValueError(f"Invalid id") from exc
 
 # ─── HTML ────────────────────────────────────────────────────────────────────
+
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login - Security News Monitor</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#0d1117; --surface:#161b22; --border:#30363d;
+    --text:#c9d1d9; --accent:#58a6ff; --red:#f85149;
+    --input-bg:#010409; --input-border:#21262d;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; font-family:'Inter', sans-serif; }
+  body { display:flex; align-items:center; justify-content:center; min-height:100vh; background:var(--bg); color:var(--text); }
+  .login-card {
+    background: var(--surface); padding: 40px; border-radius: 12px;
+    border: 1px solid var(--border); width: 100%; max-width: 400px;
+    box-shadow: 0 24px 48px rgba(0,0,0,0.5);
+    position: relative; overflow: hidden;
+  }
+  .login-card::before {
+    content: ""; position: absolute; top: 0; left: 0; width: 100%; height: 4px;
+    background: linear-gradient(90deg, var(--accent), var(--red));
+  }
+  .header { text-align: center; margin-bottom: 30px; }
+  .header svg { color: var(--red); margin-bottom: 10px; }
+  .header h1 { font-size: 24px; font-weight: 600; color: #fff; margin-bottom: 5px; }
+  .header p { font-size: 14px; color: #8b949e; }
+  .form-group { margin-bottom: 20px; }
+  .form-group label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 8px; }
+  .form-input {
+    width: 100%; background: var(--input-bg); border: 1px solid var(--input-border);
+    color: var(--text); padding: 12px; border-radius: 6px; font-size: 14px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .form-input:focus {
+    outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(88,166,255,0.1);
+  }
+  .btn {
+    width: 100%; background: var(--accent); color: #0d1117;
+    border: none; padding: 12px; border-radius: 6px; font-size: 14px;
+    font-weight: 600; cursor: pointer; transition: background 0.15s;
+    margin-top: 10px; display: flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  .btn:hover { background: #79c0ff; }
+  .btn:disabled { opacity: 0.7; cursor: not-allowed; }
+  .error-block {
+    display: none; background: rgba(248,81,73,0.1); border: 1px solid rgba(248,81,73,0.25);
+    color: var(--red); padding: 12px; border-radius: 6px; font-size: 13px;
+    margin-bottom: 20px;
+  }
+</style>
+</head>
+<body>
+<div class="login-card">
+  <div class="header">
+    <svg width="40" height="40" viewBox="0 0 24 24" fill="currentColor"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z"/></svg>
+    <h1>SecNews Monitor</h1>
+    <p>Sign in to access your dashboard</p>
+  </div>
+  <div id="errorBox" class="error-block"></div>
+  <form id="loginForm" onsubmit="handleLogin(event)">
+    <div class="form-group">
+      <label>Username</label>
+      <input type="text" id="username" class="form-input" required autofocus>
+    </div>
+    <div class="form-group">
+      <label>Password</label>
+      <input type="password" id="password" class="form-input" required>
+    </div>
+    <button type="submit" id="submitBtn" class="btn">Sign in</button>
+  </form>
+</div>
+<script>
+async function handleLogin(e) {
+  e.preventDefault();
+  const u = document.getElementById('username').value;
+  const p = document.getElementById('password').value;
+  const btn = document.getElementById('submitBtn');
+  const err = document.getElementById('errorBox');
+  
+  btn.disabled = true;
+  btn.textContent = 'Verifying...';
+  err.style.display = 'none';
+  
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({username: u, password: p})
+    });
+    const data = await res.json();
+    if(res.ok && data.ok) {
+      btn.textContent = 'Success!';
+      window.location.href = '/';
+    } else {
+      throw new Error(data.error || 'Invalid credentials');
+    }
+  } catch(ex) {
+    err.textContent = ex.message;
+    err.style.display = 'block';
+    btn.disabled = false;
+    btn.textContent = 'Sign in';
+  }
+}
+</script>
+</body>
+</html>"""
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -166,11 +336,27 @@ HTML = r"""<!DOCTYPE html>
   .sp-item-cnt{font-size:10px;color:var(--muted)}
   .filter-apply{margin-left:auto}
 
+  /* ── Category filter chips ── */
+  .cat-bar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;align-items:center}
+  .cat-bar-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-right:2px;white-space:nowrap}
+  .cat-chip{display:inline-flex;align-items:center;gap:5px;border-radius:20px;padding:4px 11px;font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--border);background:var(--surface2);color:var(--muted);transition:all .15s;user-select:none}
+  .cat-chip:hover{border-color:var(--accent);color:var(--text)}
+  .cat-chip.active{color:#000;font-weight:600}
+  .cat-chip[data-cat="ransomware"].active{background:#f85149;border-color:#f85149}
+  .cat-chip[data-cat="databreach"].active{background:#d29922;border-color:#d29922}
+  .cat-chip[data-cat="vulnerability"].active{background:#388bfd;border-color:#388bfd}
+  .cat-chip[data-cat="malware"].active{background:#bc8cff;border-color:#bc8cff}
+  .cat-chip[data-cat="apt"].active{background:#ff7b72;border-color:#ff7b72}
+  .cat-chip[data-cat="phishing"].active{background:#3fb950;border-color:#3fb950}
+  .cat-chip[data-cat="other"].active{background:#8b949e;border-color:#8b949e;color:#fff}
+  .cat-chip .cat-dot{width:7px;height:7px;border-radius:50%;background:currentColor;opacity:.7;flex-shrink:0}
+
   /* Active filter chips */
   .active-filters{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;min-height:4px}
   .chip{display:inline-flex;align-items:center;gap:4px;border-radius:20px;padding:3px 8px 3px 10px;font-size:12px}
   .chip-src{background:rgba(88,166,255,.1);border:1px solid rgba(88,166,255,.25);color:var(--accent)}
   .chip-date{background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.25);color:var(--orange)}
+  .chip-cat{background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.25);color:var(--red)}
   .chip-x{cursor:pointer;opacity:.55;font-size:15px;line-height:1;margin-left:1px}
   .chip-x:hover{opacity:1}
 
@@ -317,6 +503,10 @@ HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="s-footer" style="display:flex;flex-direction:column;gap:6px">
+    <button class="btn" style="width:100%;font-size:12px;color:var(--text);background:var(--surface2)" onclick="logout()" title="Securely sign out">
+      <svg style="vertical-align:-3px;margin-right:2px" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+      Sign Out
+    </button>
     <button class="btn primary" style="width:100%" onclick="triggerFetchAll()">
       ⬇ Fetch All Feeds
     </button>
@@ -345,6 +535,18 @@ HTML = r"""<!DOCTYPE html>
         <option value="50" selected>50 / page</option>
         <option value="100">100 / page</option>
       </select>
+    </div>
+
+    <!-- Category chips -->
+    <div class="cat-bar">
+      <span class="cat-bar-label">🏷 Category:</span>
+      <span class="cat-chip" data-cat="ransomware" onclick="toggleCategory('ransomware',this)"><span class="cat-dot"></span>Ransomware</span>
+      <span class="cat-chip" data-cat="databreach" onclick="toggleCategory('databreach',this)"><span class="cat-dot"></span>Data Breach</span>
+      <span class="cat-chip" data-cat="vulnerability" onclick="toggleCategory('vulnerability',this)"><span class="cat-dot"></span>Vulnerability</span>
+      <span class="cat-chip" data-cat="malware" onclick="toggleCategory('malware',this)"><span class="cat-dot"></span>Malware</span>
+      <span class="cat-chip" data-cat="apt" onclick="toggleCategory('apt',this)"><span class="cat-dot"></span>APT / Espionage</span>
+      <span class="cat-chip" data-cat="phishing" onclick="toggleCategory('phishing',this)"><span class="cat-dot"></span>Phishing</span>
+      <span class="cat-chip" data-cat="other" onclick="toggleCategory('other',this)"><span class="cat-dot"></span>Other</span>
     </div>
 
     <!-- Filter bar -->
@@ -621,11 +823,22 @@ HTML = r"""<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 
 <script>
+const CATEGORY_LABELS = {
+  ransomware:    'Ransomware',
+  databreach:    'Data Breach',
+  vulnerability: 'Vulnerability',
+  malware:       'Malware',
+  apt:           'APT / Espionage',
+  phishing:      'Phishing',
+  other:         'Other',
+};
+
 const ns = {
   source: null, search: '', page: 1, total: 0, timer: null,
   dateFrom: '', dateTo: '',
   selectedSources: new Set(),
   allSources: [],   // [{source, count}] populated from stats
+  category: null,   // active category filter key
 };
 
 // close source picker when clicking outside
@@ -687,6 +900,7 @@ async function loadArticles() {
   if (ns.search)   params.q         = ns.search;
   if (ns.dateFrom) params.date_from = ns.dateFrom;
   if (ns.dateTo)   params.date_to   = ns.dateTo;
+  if (ns.category) params.category  = ns.category;
   if (ns.selectedSources.size > 0) {
     params.sources = Array.from(ns.selectedSources).join(',');
   } else if (ns.source) {
@@ -701,6 +915,7 @@ async function loadArticles() {
     // results info
     let info = `<span>${d.total.toLocaleString()}</span> articles`;
     if (ns.search) info += ` matching "<strong>${esc(ns.search)}</strong>"`;
+    if (ns.category) info += ` in <strong>${CATEGORY_LABELS[ns.category]||ns.category}</strong>`;
     if (ns.selectedSources.size > 0) info += ` from <strong>${ns.selectedSources.size} source${ns.selectedSources.size>1?'s':''}</strong>`;
     else if (ns.source) info += ` from <strong>${esc(ns.source)}</strong>`;
     if (ns.dateFrom || ns.dateTo) {
@@ -801,9 +1016,29 @@ function clearFilters() {
   document.getElementById('dateTo').value   = '';
   document.getElementById('dateFrom').max   = '';
   document.getElementById('dateTo').min     = '';
+  // clear category
+  ns.category = null;
+  document.querySelectorAll('.cat-chip').forEach(c => c.classList.remove('active'));
   updateSourceBtn();
   renderActiveFilters();
   ns.page = 1;
+  loadArticles();
+}
+
+// ── Category filter ───────────────────────────────────────────────────────────
+function toggleCategory(cat, el) {
+  if (ns.category === cat) {
+    // deselect
+    ns.category = null;
+    el.classList.remove('active');
+  } else {
+    // deselect previous
+    document.querySelectorAll('.cat-chip').forEach(c => c.classList.remove('active'));
+    ns.category = cat;
+    el.classList.add('active');
+  }
+  ns.page = 1;
+  renderActiveFilters();
   loadArticles();
 }
 
@@ -862,6 +1097,7 @@ function updateSourceBtn() {
 function renderActiveFilters() {
   const el = document.getElementById('activeFilters');
   let chips = '';
+  if (ns.category) chips += `<span class="chip chip-cat">🏷 ${esc(CATEGORY_LABELS[ns.category]||ns.category)} <span class="chip-x" onclick="removeFilter('category')">×</span></span>`;
   if (ns.dateFrom) chips += `<span class="chip chip-date">From: ${ns.dateFrom} <span class="chip-x" onclick="removeFilter('dateFrom')">×</span></span>`;
   if (ns.dateTo)   chips += `<span class="chip chip-date">To: ${ns.dateTo} <span class="chip-x" onclick="removeFilter('dateTo')">×</span></span>`;
   ns.selectedSources.forEach(src => {
@@ -871,7 +1107,10 @@ function renderActiveFilters() {
 }
 
 function removeFilter(type, val) {
-  if (type === 'dateFrom') {
+  if (type === 'category') {
+    ns.category = null;
+    document.querySelectorAll('.cat-chip').forEach(c => c.classList.remove('active'));
+  } else if (type === 'dateFrom') {
     ns.dateFrom = '';
     document.getElementById('dateFrom').value = '';
     document.getElementById('dateTo').min = '';
@@ -1018,23 +1257,46 @@ async function triggerFetchAll() {
     if (document.getElementById('pageSources').style.display !== 'none') loadFeedTable();
   } catch(e) { overlay.classList.remove('show'); showToast('Fetch failed','error'); }
 }
+}
+
+function handle401(r) {
+  if (r.status === 401) {
+    window.location.href = '/login';
+    return true;
+  }
+  return false;
+}
 
 async function fetchJSON(url) {
-  const r = await fetch(url); const d = await r.json();
+  const r = await fetch(url);
+  if (handle401(r)) return new Promise(() => {}); // hang forever instead of throwing while redirect happens
+  const d = await r.json();
   if (!r.ok) throw new Error(d.error||r.statusText); return d;
 }
 async function postJSON(url, body) {
-  const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  if (handle401(r)) return new Promise(() => {});
   const d = await r.json(); if (!r.ok) throw new Error(d.error||r.statusText); return d;
 }
 async function patchJSON(url, body) {
-  const r = await fetch(url,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const r = await fetch(url,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  if (handle401(r)) return new Promise(() => {});
   const d = await r.json(); if (!r.ok) throw new Error(d.error||r.statusText); return d;
 }
 async function deleteReq(url) {
-  const r = await fetch(url,{method:'DELETE'}); const d = await r.json();
+  const r = await fetch(url,{method:'DELETE'});
+  if (handle401(r)) return new Promise(() => {});
+  const d = await r.json();
   if (!r.ok) throw new Error(d.error||r.statusText); return d;
 }
+
+async function logout() {
+  try {
+    await postJSON('/api/logout');
+  } catch(e) {}
+  window.location.href = '/login';
+}
+
 function esc(s) {
   if (!s) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -1221,15 +1483,56 @@ async function runNow() {
 
 # ─── API handlers ─────────────────────────────────────────────────────────────
 
+# Keywords for each category — matched against title + summary (case-insensitive)
+CATEGORY_KEYWORDS: dict = {
+    "ransomware":    ["ransomware", "ransom", "encrypt.*file", "decrypt.*key", "lockbit", "blackcat", "cl0p", "conti", "ryuk", "revil", "darkside", "blackbasta"],
+    "databreach":   ["data breach", "data leak", "leaked data", "exposed data", "личные данные", "ข้อมูลหลุด", "ข้อมูลรั่ว", "personal data", "pii", "credentials leak", "database leak", "millions of records"],
+    "vulnerability": ["vulnerability", "cve-", "zero.?day", "rce", "remote code execution", "critical flaw", "patch", "exploit", "cvss", "buffer overflow", "sql injection", "xss"],
+    "malware":      ["malware", "trojan", "backdoor", "spyware", "rootkit", "worm", "virus", "infostealer", "keylogger", "botnet", "rat ", "remote access tool"],
+    "apt":          ["apt", "nation.?state", "espionage", "cyber espionage", "apt4[0-9]", "lazarus", "fancy bear", "cozy bear", "volt typhoon", "salt typhoon", "mustang panda"],
+    "phishing":     ["phishing", "spear.?phishing", "smishing", "vishing", "business email compromise", "bec", "credential harvest", "fake login"],
+    "other":        [],  # "other" = articles that don't match any above category
+}
+
+
+def _category_filter(category: str) -> dict:
+    """Build a MongoDB $or filter for a category based on its keywords."""
+    if category == "other":
+        # Exclude articles matching ANY known category
+        all_kw = [kw for cat, kws in CATEGORY_KEYWORDS.items() if cat != "other" for kw in kws]
+        conditions = [{"title": {"$regex": kw, "$options": "i"}} for kw in all_kw]
+        conditions += [{"summary": {"$regex": kw, "$options": "i"}} for kw in all_kw]
+        return {"$nor": conditions}
+    kws = CATEGORY_KEYWORDS.get(category, [])
+    if not kws:
+        return {}
+    conditions = [{"title": {"$regex": kw, "$options": "i"}} for kw in kws]
+    conditions += [{"summary": {"$regex": kw, "$options": "i"}} for kw in kws]
+    return {"$or": conditions}
+
+
 def api_articles(params: dict) -> dict:
-    page        = int(params.get("page",     ["1"])[0])
-    per_page    = min(int(params.get("per_page", ["50"])[0]), 200)
-    sort        = params.get("sort",      ["published"])[0]
+    # [SECURITY] Clamp page and per_page to valid ranges
+    try:
+        page     = max(1, int(params.get("page",     ["1"])[0]))
+        per_page = max(1, min(200, int(params.get("per_page", ["50"])[0])))
+    except (ValueError, TypeError):
+        page, per_page = 1, 50
+
+    # [SECURITY] Whitelist sort values
+    sort_raw = params.get("sort", ["published"])[0]
+    sort     = sort_raw if sort_raw in ("published", "fetched_at") else "published"
+
     source      = params.get("source",    [None])[0]
     q           = params.get("q",         [None])[0]
     date_from   = params.get("date_from", [None])[0]
     date_to     = params.get("date_to",   [None])[0]
     sources_str = params.get("sources",   [None])[0]   # comma-separated
+    category    = params.get("category",  [None])[0]   # category key
+
+    # [SECURITY] Cap search query length to limit regex complexity (ReDoS mitigation)
+    if q:
+        q = q[:200]
 
     filt = {}
 
@@ -1247,6 +1550,15 @@ def api_articles(params: dict) -> dict:
             {"title":   {"$regex": q, "$options": "i"}},
             {"summary": {"$regex": q, "$options": "i"}},
         ]
+
+    # Category filter — merge with $and if needed
+    if category and category in CATEGORY_KEYWORDS:
+        cat_filt = _category_filter(category)
+        if cat_filt:
+            if "$and" in filt:
+                filt["$and"].append(cat_filt)
+            else:
+                filt["$and"] = [cat_filt]
 
     # Date range — use published_dt (UTC datetime) for reliable comparison
     if date_from or date_to:
@@ -1310,6 +1622,14 @@ def api_add_feed(body: dict) -> dict:
     url  = (body.get("url")  or "").strip()
     if not name or not url:
         raise ValueError("name and url are required")
+    if len(name) > 120:
+        raise ValueError("name too long (max 120 chars)")
+    if len(url) > 1024:
+        raise ValueError("url too long (max 1024 chars)")
+    # [SECURITY] Only allow http/https schemes for feed URLs
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http/https URLs are allowed")
     db  = get_db()
     now = datetime.now(timezone.utc)
     try:
@@ -1318,7 +1638,7 @@ def api_add_feed(body: dict) -> dict:
              "last_fetch": None, "created_at": now}
         )
     except DuplicateKeyError:
-        raise ValueError(f"A feed named '{name}' already exists")
+        raise ValueError("A feed with that name already exists")
     return {"id": str(result.inserted_id), "name": name, "url": url}
 
 
@@ -1326,6 +1646,10 @@ def api_test_feed(body: dict) -> dict:
     url = (body.get("url") or "").strip()
     if not url:
         raise ValueError("url is required")
+    # [SECURITY] Only allow http/https schemes
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in ("http", "https"):
+        raise ValueError("Only http/https URLs are allowed")
     data = fetch_url(url, timeout=10)
     if data is None:
         raise ValueError("Could not fetch URL — check it is reachable")
@@ -1394,23 +1718,41 @@ def api_save_settings(body: dict) -> dict:
     if "discord" in body:
         disc = doc.setdefault("discord", {})
         if "webhook_url" in body["discord"] and body["discord"]["webhook_url"]:
-            disc["webhook_url"] = body["discord"]["webhook_url"]
+            wh_url = str(body["discord"]["webhook_url"]).strip()
+            # [SECURITY] SSRF prevention — only allow real Discord webhook URLs
+            if not wh_url.startswith("https://discord.com/api/webhooks/"):
+                raise ValueError("Invalid Discord webhook URL")
+            disc["webhook_url"] = wh_url
         if "enabled" in body["discord"]:
             disc["enabled"] = bool(body["discord"]["enabled"])
 
     if "telegram" in body:
         tg = doc.setdefault("telegram", {})
         if "token" in body["telegram"] and body["telegram"]["token"]:
-            tg["token"]   = body["telegram"]["token"]
+            token = str(body["telegram"]["token"]).strip()
+            # [SECURITY] Basic Telegram token format: digits:alphanum
+            if not re.match(r'^\d+:[A-Za-z0-9_-]{35,}$', token):
+                raise ValueError("Invalid Telegram bot token format")
+            tg["token"] = token
         if "chat_id" in body["telegram"] and body["telegram"]["chat_id"]:
-            tg["chat_id"] = body["telegram"]["chat_id"]
+            chat_id = str(body["telegram"]["chat_id"]).strip()
+            # [SECURITY] chat_id is numeric (possibly negative) or @channel
+            if not re.match(r'^-?\d+$|^@[A-Za-z0-9_]{5,}$', chat_id):
+                raise ValueError("Invalid Telegram chat_id format")
+            tg["chat_id"] = chat_id
         if "enabled" in body["telegram"]:
             tg["enabled"] = bool(body["telegram"]["enabled"])
 
     if "scheduler" in body:
         sc = doc.setdefault("scheduler", {})
-        if "hour"    in body["scheduler"]: sc["hour"]    = int(body["scheduler"]["hour"])
-        if "minute"  in body["scheduler"]: sc["minute"]  = int(body["scheduler"]["minute"])
+        if "hour"    in body["scheduler"]:
+            h = int(body["scheduler"]["hour"])
+            if not 0 <= h <= 23: raise ValueError("hour must be 0-23")
+            sc["hour"] = h
+        if "minute"  in body["scheduler"]:
+            m = int(body["scheduler"]["minute"])
+            if not 0 <= m <= 59: raise ValueError("minute must be 0-59")
+            sc["minute"] = m
         if "enabled" in body["scheduler"]: sc["enabled"] = bool(body["scheduler"]["enabled"])
         # Hot-reload scheduler
         sched.reconfigure(
@@ -1497,13 +1839,82 @@ OID_RE  = r"[a-f0-9]{24}"
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        print(f"  {self.address_string()} {fmt % args}")
+        log.info("%s %s", self.address_string(), fmt % args)
+
+    # ── Security helpers ──────────────────────────────────────────────────────
+
+    def _add_security_headers(self):
+        for k, v in _SECURITY_HEADERS.items():
+            self.send_header(k, v)
+
+    def _read_cookies(self) -> dict:
+        cookies = {}
+        cookie_header = self.headers.get("Cookie")
+        if cookie_header:
+            for item in cookie_header.split(";"):
+                parts = item.strip().split("=", 1)
+                if len(parts) == 2:
+                    cookies[parts[0]] = parts[1]
+        return cookies
+
+    def _sign_cookie(self, data: str) -> str:
+        sig = hmac.new(_SESSION_SECRET.encode(), data.encode(), hashlib.sha256).hexdigest()
+        return f"{data}.{sig}"
+
+    def _verify_cookie(self, cookie_val: str) -> bool:
+        if not cookie_val or "." not in cookie_val:
+            return False
+        data, sig = cookie_val.rsplit(".", 1)
+        expected_sig = hmac.new(_SESSION_SECRET.encode(), data.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected_sig)
+
+    def _check_auth(self) -> bool:
+        """Return True if session passes (or auth is disabled)."""
+        if not _AUTH_ENABLED:
+            return True
+        cookies = self._read_cookies()
+        session_val = cookies.get("secnews_session")
+        return self._verify_cookie(session_val)
+
+    def _require_auth(self) -> bool:
+        """Send 401/302 and return False if auth fails."""
+        if not self._check_auth():
+            if self.path.startswith("/api/"):
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self._add_security_headers()
+                self.end_headers()
+                self.wfile.write(b'{"error":"Unauthorized"}')
+            else:
+                self.send_response(302)
+                self.send_header("Location", "/login")
+                self._add_security_headers()
+                self.end_headers()
+            return False
+        return True
+
+    def _check_rate_limit(self) -> bool:
+        """Send 429 and return False if rate limit exceeded."""
+        ip = self.client_address[0]
+        if not _check_rate(ip):
+            log.warning("Rate limit exceeded for %s", ip)
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", str(_RATE_WINDOW))
+            self._add_security_headers()
+            self.end_headers()
+            self.wfile.write(b'{"error":"Too many requests"}')
+            return False
+        return True
+
+    # ── Response senders ─────────────────────────────────────────────────────
 
     def send_json(self, data, status: int = 200):
         body = json.dumps(data, default=str).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(body))
+        self._add_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -1512,17 +1923,40 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", len(body))
+        self._add_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def read_body(self) -> dict:
-        n = int(self.headers.get("Content-Length", 0))
+        # [SECURITY] Enforce max body size to prevent OOM
+        raw_len = self.headers.get("Content-Length", "0")
+        try:
+            n = int(raw_len)
+        except ValueError:
+            n = 0
+        if n < 0 or n > MAX_BODY_BYTES:
+            raise ValueError(f"Request body too large (max {MAX_BODY_BYTES // 1024} KB)")
         return json.loads(self.rfile.read(n)) if n else {}
 
+    # ── HTTP verbs ────────────────────────────────────────────────────────────
+
     def do_GET(self):
+        if not self._check_rate_limit(): return
         parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
         path   = parsed.path
+        
+        # Public route
+        if path == "/login":
+            if self._check_auth():
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
+            self.send_html(LOGIN_HTML)
+            return
+
+        if not self._require_auth():     return
+        params = parse_qs(parsed.query)
         try:
             if   path == "/":                      self.send_html(HTML)
             elif path == "/api/articles":          self.send_json(api_articles(params))
@@ -1531,12 +1965,49 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/settings":          self.send_json(api_get_settings())
             elif path == "/api/scheduler/status":  self.send_json(api_scheduler_status())
             else:                                  self.send_json({"error": "not found"}, 404)
+        except ValueError as e:
+            self.send_json({"error": str(e)}, 400)
         except Exception as e:
-            self.send_json({"error": str(e)}, 500)
+            log.exception("GET %s unhandled error", path)
+            self.send_json({"error": "Internal server error"}, 500)
 
     def do_POST(self):
+        if not self._check_rate_limit(): return
         path = urlparse(self.path).path
-        body = self.read_body()
+        try:
+            body = self.read_body()
+        except (ValueError, json.JSONDecodeError) as e:
+            self.send_json({"error": str(e)}, 400)
+            return
+
+        if path == "/api/login":
+            user = body.get("username", "")
+            pwd  = body.get("password", "")
+            if _AUTH_ENABLED and hmac.compare_digest(user, _ADMIN_USER) and hmac.compare_digest(pwd, _ADMIN_PASS):
+                val = self._sign_cookie("auth_ok")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", f"secnews_session={val}; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax")
+                self._add_security_headers()
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+            elif not _AUTH_ENABLED:
+                self.send_json({"error": "Auth is disabled, no login required."}, 400)
+            else:
+                self.send_json({"error": "Invalid credentials"}, 401)
+            return
+            
+        if path == "/api/logout":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", "secnews_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax")
+            self._add_security_headers()
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+            return
+
+        if not self._require_auth():     return
+
         try:
             if   path == "/api/fetch":           self.send_json(api_fetch_all())
             elif path == "/api/feeds":           self.send_json(api_add_feed(body), 201)
@@ -1553,25 +2024,39 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             self.send_json({"error": str(e)}, 400)
         except Exception as e:
-            self.send_json({"error": str(e)}, 500)
+            log.exception("POST %s unhandled error", path)
+            self.send_json({"error": "Internal server error"}, 500)
 
     def do_PATCH(self):
+        if not self._check_rate_limit(): return
+        if not self._require_auth():     return
         path = urlparse(self.path).path
-        body = self.read_body()
+        try:
+            body = self.read_body()
+        except (ValueError, json.JSONDecodeError) as e:
+            self.send_json({"error": str(e)}, 400)
+            return
         m = re.match(rf"^/api/feeds/({OID_RE})$", path)
         if m:
             try:    self.send_json(api_toggle_feed(m.group(1), body))
-            except Exception as e: self.send_json({"error": str(e)}, 500)
+            except ValueError as e: self.send_json({"error": str(e)}, 400)
+            except Exception as e:
+                log.exception("PATCH %s unhandled error", path)
+                self.send_json({"error": "Internal server error"}, 500)
         else:
             self.send_json({"error": "not found"}, 404)
 
     def do_DELETE(self):
+        if not self._check_rate_limit(): return
+        if not self._require_auth():     return
         path = urlparse(self.path).path
         m = re.match(rf"^/api/feeds/({OID_RE})$", path)
         if m:
             try:    self.send_json(api_delete_feed(m.group(1)))
             except ValueError as e: self.send_json({"error": str(e)}, 404)
-            except Exception as e:  self.send_json({"error": str(e)}, 500)
+            except Exception as e:
+                log.exception("DELETE %s unhandled error", path)
+                self.send_json({"error": "Internal server error"}, 500)
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -1597,9 +2082,19 @@ def main():
         enabled = sc_doc.get("enabled", True),
     )
 
+    if not _AUTH_ENABLED:
+        log.warning(
+            "⚠️  ADMIN_USER / ADMIN_PASS not set — running WITHOUT authentication! "
+            "Set both env vars to enable HTTP Basic Auth."
+        )
+    else:
+        log.info("HTTP Basic Auth enabled for user '%s'", _ADMIN_USER)
+
     server = HTTPServer((args.host, args.port), Handler)
     print(f"Security News Monitor → http://{args.host}:{args.port}")
     print(f"MongoDB: {MONGO_URI}/{DB_NAME}")
+    print(f"Auth: {'ENABLED (user: ' + _ADMIN_USER + ')' if _AUTH_ENABLED else 'DISABLED (set ADMIN_USER + ADMIN_PASS to enable)'}")
+    print(f"Rate limit: {_RATE_LIMIT} req/min per IP")
     print("Scheduler: daily fetch 09:00 Asia/Bangkok")
     print("Press Ctrl+C to stop.\n")
     try:

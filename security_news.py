@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 import urllib.request
 import urllib.error
+import urllib.parse
 import http.cookiejar
 import xml.etree.ElementTree as ET
 
@@ -143,11 +144,16 @@ _HEADERS = {
 
 def fetch_url(url: str, timeout: int = 15) -> Optional[bytes]:
     """Fetch URL with cookie support and retry for WAF challenges (Incapsula)."""
-    import ssl
     import time
 
+    # [SECURITY] Only allow http/https to prevent SSRF via file:// etc.
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        print(f"  [WARN] Blocked non-http(s) URL scheme: {parsed.scheme}://{parsed.netloc}",
+              file=sys.stderr)
+        return None
+
     cj     = http.cookiejar.CookieJar()
-    # Try with default SSL first; fall back to unverified if needed
     handlers = [urllib.request.HTTPCookieProcessor(cj)]
     opener   = urllib.request.build_opener(*handlers)
 
@@ -155,7 +161,8 @@ def fetch_url(url: str, timeout: int = 15) -> Optional[bytes]:
         req = urllib.request.Request(url, headers=_HEADERS)
         try:
             with opener.open(req, timeout=timeout) as resp:
-                data = resp.read()
+                # [SECURITY] Cap read size to 5MB to prevent OOM / XML bombs
+                data = resp.read(5 * 1024 * 1024)
             # Check if we got a WAF challenge page instead of real content
             if b'<rss' in data[:500] or b'<feed' in data[:500] or b'<?xml' in data[:200]:
                 return data
@@ -176,19 +183,14 @@ def fetch_url(url: str, timeout: int = 15) -> Optional[bytes]:
         except urllib.error.URLError as e:
             reason = str(e.reason) if hasattr(e, 'reason') else str(e)
             print(f"  [WARN] URLError for {url}: {reason} (attempt {attempt+1})", file=sys.stderr)
-            # SSL certificate error → retry with unverified context
+            # [SECURITY] Do NOT silently disable SSL verification — log and skip instead
             if 'CERTIFICATE_VERIFY_FAILED' in reason or 'SSL' in reason:
-                print(f"  [INFO] Retrying {url} with unverified SSL…", file=sys.stderr)
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                handlers = [
-                    urllib.request.HTTPCookieProcessor(cj),
-                    urllib.request.HTTPSHandler(context=ctx),
-                ]
-                opener = urllib.request.build_opener(*handlers)
-                time.sleep(0.5)
-                continue
+                print(
+                    f"  [WARN] SSL certificate error for {url} — skipping (certificate validation "
+                    f"is required for security). Verify the feed URL is correct.",
+                    file=sys.stderr,
+                )
+                return None
             if attempt < 2:
                 time.sleep(1)
                 continue
@@ -230,6 +232,7 @@ def strip_tags(text: Optional[str]) -> str:
 
 
 def parse_rss(data: bytes, source: str) -> list[dict]:
+    _MAX_ARTICLES = 500  # [SECURITY] Cap articles per feed to prevent memory exhaustion
     articles = []
     try:
         root = ET.fromstring(data)
@@ -239,9 +242,17 @@ def parse_rss(data: bytes, source: str) -> list[dict]:
 
     ns = {"atom": "http://www.w3.org/2005/Atom"}
 
+    def _safe_url(u: str) -> str:
+        """Return url only if it has http/https scheme, else empty string."""
+        u = (u or "").strip()
+        p = urllib.parse.urlparse(u)
+        return u if p.scheme in ("http", "https") else ""
+
     # Atom
     if root.tag == "{http://www.w3.org/2005/Atom}feed":
         for entry in root.findall("atom:entry", ns):
+            if len(articles) >= _MAX_ARTICLES:
+                break
             title_el   = entry.find("atom:title",   ns)
             link_el    = entry.find("atom:link",    ns)
             summary_el = entry.find("atom:summary", ns) or entry.find("atom:content", ns)
@@ -249,12 +260,13 @@ def parse_rss(data: bytes, source: str) -> list[dict]:
             url = ""
             if link_el is not None:
                 url = link_el.get("href", link_el.text or "")
+            url = _safe_url(url)   # [SECURITY] validate URL scheme
             if not url:
                 continue
             articles.append({
                 "source":    source,
                 "title":     strip_tags(title_el.text if title_el is not None else ""),
-                "url":       url.strip(),
+                "url":       url,
                 "summary":   strip_tags(summary_el.text if summary_el is not None else ""),
                 "published": parse_date(date_el.text if date_el is not None else None),
             })
@@ -263,6 +275,8 @@ def parse_rss(data: bytes, source: str) -> list[dict]:
     # RSS 2.0
     channel = root.find("channel") or root
     for item in channel.findall("item"):
+        if len(articles) >= _MAX_ARTICLES:
+            break
         title_el = item.find("title")
         link_el  = item.find("link")
         desc_el  = item.find("description")
@@ -273,6 +287,7 @@ def parse_rss(data: bytes, source: str) -> list[dict]:
             guid_el = item.find("guid")
             if guid_el is not None and (guid_el.text or "").startswith("http"):
                 url = guid_el.text.strip()
+        url = _safe_url(url)   # [SECURITY] validate URL scheme
         if not url:
             continue
 

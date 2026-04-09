@@ -8,7 +8,7 @@ and sends Discord / Telegram notifications if new articles are found.
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Callable, Optional
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -16,8 +16,8 @@ from apscheduler.triggers.cron import CronTrigger
 
 log = logging.getLogger("secnews.scheduler")
 
-_scheduler: BackgroundScheduler | None = None
-_get_db: Callable | None = None
+_scheduler: Optional[BackgroundScheduler] = None
+_get_db: Optional[Callable] = None
 
 JOB_ID   = "daily_fetch"
 RUNS_COL = "scheduler_runs"   # MongoDB collection for run history
