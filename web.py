@@ -16,7 +16,7 @@ import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 from pymongo import MongoClient, DESCENDING
@@ -864,8 +864,8 @@ function showPage(name) {
 }
 
 async function init() {
-  await loadStats();
-  await loadArticles();
+  loadStats();
+  loadArticles();
 }
 
 async function loadStats() {
@@ -2104,7 +2104,7 @@ def main():
     else:
         log.info("HTTP Basic Auth enabled for user '%s'", _ADMIN_USER)
 
-    server = HTTPServer((args.host, args.port), Handler)
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Security News Monitor → http://{args.host}:{args.port}")
     print(f"MongoDB: {MONGO_URI}/{DB_NAME}")
     print(f"Auth: {'ENABLED (user: ' + _ADMIN_USER + ')' if _AUTH_ENABLED else 'DISABLED (set ADMIN_USER + ADMIN_PASS to enable)'}")
