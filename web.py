@@ -1257,7 +1257,6 @@ async function triggerFetchAll() {
     if (document.getElementById('pageSources').style.display !== 'none') loadFeedTable();
   } catch(e) { overlay.classList.remove('show'); showToast('Fetch failed','error'); }
 }
-}
 
 function handle401(r) {
   if (r.status === 401) {
@@ -1572,7 +1571,12 @@ def api_articles(params: dict) -> dict:
 
     sort_field = "published_dt" if sort == "published" else "fetched_at"
     db     = get_db()
-    total  = db.articles.count_documents(filt)
+
+    if not filt:
+        total = db.articles.estimated_document_count()
+    else:
+        total  = db.articles.count_documents(filt)
+
     cursor = db.articles.find(
         filt,
         {"_id": 0, "source": 1, "title": 1, "url": 1, "summary": 1, "published": 1},
@@ -1582,17 +1586,27 @@ def api_articles(params: dict) -> dict:
             "articles": list(cursor)}
 
 
+_stats_cache = {"ts": 0, "data": None}
+
 def api_stats() -> dict:
+    import time
+    now = time.monotonic()
+    if _stats_cache["data"] and now - _stats_cache["ts"] < 300:
+        return _stats_cache["data"]
+
     db         = get_db()
-    total      = db.articles.count_documents({})
+    total      = db.articles.estimated_document_count()
     feed_count = db.feeds.count_documents({})
     pipeline   = [
         {"$group": {"_id": "$source", "count": {"$sum": 1}}},
         {"$sort":  {"count": DESCENDING}},
         {"$project": {"source": "$_id", "count": 1, "_id": 0}},
     ]
-    return {"total": total, "feed_count": feed_count,
+    data = {"total": total, "feed_count": feed_count,
             "sources": list(db.articles.aggregate(pipeline))}
+    _stats_cache["ts"] = now
+    _stats_cache["data"] = data
+    return data
 
 
 def api_get_feeds() -> list:
