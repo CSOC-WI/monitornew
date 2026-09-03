@@ -936,7 +936,7 @@ function renderCard(a) {
   const sum  = a.summary ? `<div class="card-summary">${esc(a.summary.substring(0,240))}${a.summary.length>240?'…':''}</div>` : '';
   return `<div class="card">
     <div class="card-meta"><span class="source-tag ${cls}">${esc(a.source)}</span><span class="date-tag">${date}</span></div>
-    <div class="card-title"><a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.title)}</a></div>${sum}</div>`;
+    <div class="card-title"><a href="${safeUrl(a.url)}" target="_blank" rel="noopener noreferrer">${esc(a.title)}</a></div>${sum}</div>`;
 }
 function srcClass(s) {
   s = s.toLowerCase();
@@ -1298,7 +1298,15 @@ async function logout() {
 
 function esc(s) {
   if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function safeUrl(u) {
+  if (!u) return '#';
+  try {
+    const p = new URL(u, window.location.origin);
+    if (p.protocol === 'http:' || p.protocol === 'https:') return esc(u);
+  } catch(e) {}
+  return '#';
 }
 function showToast(msg,type='success') {
   const t = document.getElementById('toast');
@@ -1543,11 +1551,12 @@ def api_articles(params: dict) -> dict:
     elif source:
         filt["source"] = source
 
-    # Full-text search
+    # Full-text search (ReDoS and regex injection safe)
     if q:
+        safe_q = re.escape(q)
         filt["$or"] = [
-            {"title":   {"$regex": q, "$options": "i"}},
-            {"summary": {"$regex": q, "$options": "i"}},
+            {"title":   {"$regex": safe_q, "$options": "i"}},
+            {"summary": {"$regex": safe_q, "$options": "i"}},
         ]
 
     # Category filter — merge with $and if needed
@@ -2009,9 +2018,11 @@ class Handler(BaseHTTPRequestHandler):
             pwd  = body.get("password", "")
             if _AUTH_ENABLED and hmac.compare_digest(user, _ADMIN_USER) and hmac.compare_digest(pwd, _ADMIN_PASS):
                 val = self._sign_cookie("auth_ok")
+                is_https = self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+                sec_flag = "; Secure" if is_https else ""
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Set-Cookie", f"secnews_session={val}; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax")
+                self.send_header("Set-Cookie", f"secnews_session={val}; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax{sec_flag}")
                 self._add_security_headers()
                 self.end_headers()
                 self.wfile.write(b'{"ok":true}')
@@ -2022,9 +2033,11 @@ class Handler(BaseHTTPRequestHandler):
             return
             
         if path == "/api/logout":
+            is_https = self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+            sec_flag = "; Secure" if is_https else ""
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Set-Cookie", "secnews_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax")
+            self.send_header("Set-Cookie", f"secnews_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax{sec_flag}")
             self._add_security_headers()
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
