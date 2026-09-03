@@ -1907,9 +1907,19 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _get_client_ip(self) -> str:
+        """Get client IP, resolving X-Forwarded-For or X-Real-IP if behind reverse proxy."""
+        forwarded = self.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        real_ip = self.headers.get("X-Real-IP")
+        if real_ip:
+            return real_ip.strip()
+        return self.client_address[0]
+
     def _check_rate_limit(self) -> bool:
         """Send 429 and return False if rate limit exceeded."""
-        ip = self.client_address[0]
+        ip = self._get_client_ip()
         if not _check_rate(ip):
             log.warning("Rate limit exceeded for %s", ip)
             self.send_response(429)

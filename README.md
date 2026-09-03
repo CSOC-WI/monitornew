@@ -33,11 +33,11 @@
 git clone https://github.com/<your-username>/webmonitor.git
 cd webmonitor
 
-# Start the application
+# Start the application (with Nginx reverse proxy)
 docker compose up -d
 
-# Open in browser
-open http://localhost:8080
+# Open in browser (Nginx runs on port 80)
+open http://localhost
 ```
 
 ### Optional: MongoDB Web UI (for debugging)
@@ -58,6 +58,8 @@ docker compose --profile debug up -d
 | `MONGO_URI` | `mongodb://mongodb:27017` | MongoDB connection URI |
 | `MONGO_DB` | `secnews` | Database name |
 | `TZ` | `Asia/Bangkok` | Timezone for scheduler |
+| `ADMIN_USER` | — | Admin username for Web UI (optional) |
+| `ADMIN_PASS` | — | Admin password for Web UI (optional) |
 | `DISCORD_WEBHOOK_URL` | — | Discord Webhook URL (optional) |
 | `TELEGRAM_TOKEN` | — | Telegram Bot Token (optional) |
 | `TELEGRAM_CHAT_ID` | — | Telegram Chat ID (optional) |
@@ -70,13 +72,15 @@ docker compose --profile debug up -d
 
 ```
 webmonitor/
+├── nginx/
+│   └── default.conf     # Nginx reverse proxy configuration
 ├── web.py              # Web server & UI (HTTP handler + embedded HTML/JS)
 ├── security_news.py    # RSS/Atom feed collector & MongoDB operations
 ├── notifier.py         # Discord & Telegram notification module
 ├── scheduler.py        # APScheduler auto-fetch scheduler
 ├── requirements.txt    # Python dependencies
 ├── Dockerfile          # Container build instructions
-├── docker-compose.yml  # Multi-service orchestration
+├── docker-compose.yml  # Multi-service orchestration (Nginx, App, MongoDB)
 └── README.md
 ```
 
@@ -84,21 +88,24 @@ webmonitor/
 
 ## 📡 Default RSS/Atom Sources
 
-| Source | URL |
+| Source | Focus / URL |
 |---|---|
-| Krebs on Security | krebsonsecurity.com |
-| The Hacker News | thehackernews.com |
-| BleepingComputer | bleepingcomputer.com |
-| SecurityWeek | securityweek.com |
-| Dark Reading | darkreading.com |
-| CISA Advisories | cisa.gov |
-| NVD Recent CVEs | nvd.nist.gov |
-| Schneier on Security | schneier.com |
-| SANS Internet Stormcast | isc.sans.edu |
-| TechTalkThai Security | techtalkthai.com |
-| *...and more* | |
+| Krebs on Security | Investigation & Cybercrime (`krebsonsecurity.com`) |
+| The Hacker News | Vulnerabilities & Threats (`thehackernews.com`) |
+| BleepingComputer | Malware, Ransomware & Tech (`bleepingcomputer.com`) |
+| The Record | Cyber Law, Policy & Extradition (`therecord.media`) |
+| CyberScoop | Legislation, Policy & Gov (`cyberscoop.com`) |
+| Fox Rothschild Privacy & Security | Data Privacy & Cyber Law (`dataprivacy.foxrothschild.com`) |
+| EFF Updates | Digital Rights, Privacy & Law (`eff.org`) |
+| Just Security | Cyber & National Security Law (`justsecurity.org`) |
+| HIPAA Journal | Healthcare Security & Privacy Law (`hipaajournal.com`) |
+| CISA Advisories | US Government Advisories (`cisa.gov`) |
+| NVD Recent CVEs | NIST Vulnerabilities (`nvd.nist.gov`) |
+| Schneier on Security | Cryptography & Security Policy (`schneier.com`) |
+| TechTalkThai Security | ข่าว Security & กฎหมายในไทย (`techtalkthai.com`) |
+| *...และแหล่งข่าวอื่นๆ* | |
 
-สามารถเพิ่ม/ลบ/แก้ไข sources ได้ผ่านหน้า **Manage Sources** บน Web UI
+สามารถเพิ่ม/ลบ/เปิด-ปิด sources ได้อย่างอิสระผ่านหน้า **Manage Sources** บน Web UI
 
 ---
 

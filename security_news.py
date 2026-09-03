@@ -33,21 +33,28 @@ MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME   = os.environ.get("MONGO_DB",  "secnews")
 
 DEFAULT_FEEDS = {
-    "Krebs on Security":       "https://krebsonsecurity.com/feed/",
-    "The Hacker News":         "https://feeds.feedburner.com/TheHackersNews",
-    "BleepingComputer":        "https://www.bleepingcomputer.com/feed/",
-    "SecurityWeek":            "https://feeds.feedburner.com/securityweek",
-    "Dark Reading":            "https://www.darkreading.com/rss.xml",
-    "Threatpost":              "https://threatpost.com/feed/",
-    "Graham Cluley":           "https://grahamcluley.com/feed/",
-    "CISA Advisories":         "https://www.cisa.gov/feeds/hsfeed.xml",
-    "US-CERT":                 "https://www.cisa.gov/uscert/ncas/alerts.xml",
-    "NVD Recent CVEs":         "https://nvd.nist.gov/feeds/xml/cve/misc/nvd-rss.xml",
-    "Schneier on Security":    "https://www.schneier.com/feed/atom/",
-    "Help Net Security":       "https://www.helpnetsecurity.com/feed/",
-    "Infosecurity Magazine":   "https://www.infosecurity-magazine.com/rss/news/",
-    "SANS Internet Stormcast": "https://isc.sans.edu/rssfeed_full.xml",
-    "TechTalkThai Security":   "https://www.techtalkthai.com/category/security/feed/",
+    "Krebs on Security":                     "https://krebsonsecurity.com/feed/",
+    "The Hacker News":                       "https://feeds.feedburner.com/TheHackersNews",
+    "BleepingComputer":                      "https://www.bleepingcomputer.com/feed/",
+    "SecurityWeek":                          "https://feeds.feedburner.com/securityweek",
+    "Dark Reading":                          "https://www.darkreading.com/rss.xml",
+    "Threatpost":                            "https://threatpost.com/feed/",
+    "Graham Cluley":                         "https://grahamcluley.com/feed/",
+    "CISA Advisories":                       "https://www.cisa.gov/cybersecurity-advisories/all.xml",
+    "US-CERT":                               "https://www.cisa.gov/uscert/ncas/alerts.xml",
+    "NVD Recent CVEs":                       "https://nvd.nist.gov/feeds/xml/cve/misc/nvd-rss.xml",
+    "Schneier on Security":                  "https://www.schneier.com/feed/atom/",
+    "Help Net Security":                     "https://www.helpnetsecurity.com/feed/",
+    "Infosecurity Magazine":                 "https://www.infosecurity-magazine.com/rss/news/",
+    "SANS Internet Stormcast":               "https://isc.sans.edu/rssfeed_full.xml",
+    "TechTalkThai Security":                 "https://www.techtalkthai.com/category/security/feed/",
+    # Cybersecurity Law, Policy, Privacy & Compliance
+    "The Record (Cyber Law & Policy)":       "https://therecord.media/feed",
+    "CyberScoop (Policy & Legislation)":     "https://cyberscoop.com/feed/",
+    "Fox Rothschild Privacy & Security Law": "https://dataprivacy.foxrothschild.com/feed/",
+    "EFF Updates (Digital Rights & Law)":    "https://www.eff.org/rss/updates.xml",
+    "Just Security (Cyber & Law)":           "https://www.justsecurity.org/feed/",
+    "HIPAA Journal (Healthcare Security Law)":"https://www.hipaajournal.com/feed/",
 }
 
 # ─── DB helpers ───────────────────────────────────────────────────────────────
@@ -113,7 +120,7 @@ def to_datetime(text: Optional[str]) -> Optional[datetime]:
 
 
 def init_collections(db) -> None:
-    """Create indexes and seed default feeds if first run."""
+    """Create indexes and seed/upsert default feeds."""
     db.articles.create_index("url",    unique=True)
     db.articles.create_index([("published_dt", DESCENDING)])
     db.articles.create_index([("fetched_at",   DESCENDING)])
@@ -121,14 +128,13 @@ def init_collections(db) -> None:
 
     db.feeds.create_index("name", unique=True)
 
-    if db.feeds.count_documents({}) == 0:
-        now = datetime.now(timezone.utc)
-        db.feeds.insert_many([
-            {"name": name, "url": url, "enabled": True,
-             "last_fetch": None, "created_at": now}
-            for name, url in DEFAULT_FEEDS.items()
-        ])
-        print(f"  Seeded {len(DEFAULT_FEEDS)} default feeds.")
+    now = datetime.now(timezone.utc)
+    for name, url in DEFAULT_FEEDS.items():
+        db.feeds.update_one(
+            {"name": name},
+            {"$setOnInsert": {"url": url, "enabled": True, "last_fetch": None, "created_at": now}},
+            upsert=True
+        )
 
 
 # ─── RSS fetching ─────────────────────────────────────────────────────────────
